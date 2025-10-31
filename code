@@ -1,0 +1,222 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <LiquidCrystal.h>
+#include "HX711.h"
+
+// -------- LCD (parallel 16x2) --------
+LiquidCrystal lcd(14, 12, 16, 17, 18, 19);
+
+// -------- RFID RC522 (custom SPI) --------
+#define RFID_SS   21
+#define RFID_RST  27
+#define RFID_SCK  26
+#define RFID_MISO 25
+#define RFID_MOSI 13
+MFRC522 rfid(RFID_SS, RFID_RST);
+
+// -------- IR sensor --------
+const int IR_PIN = 32; // LOW when object detected
+
+// -------- HX711 + Load cell --------
+const int HX_DOUT = 33; // DOUT
+const int HX_SCK  = 22; // SCK
+HX711 scale;
+
+// -------- Buzzer --------
+const int BUZZER_PIN = 5; // Active buzzer
+bool pillAlerted = false;
+
+// Calibration and zero
+long  zero_offset       = 47512; // raw value when empty
+float calibration_factor = 32.77; // adjust with your known weight
+
+// Helpers
+String lastUID = "----";
+unsigned long pageTimer = 0;
+byte page = 0;
+
+// Smoothing weight
+#define WEIGHT_SAMPLES 10
+float weightBuffer[WEIGHT_SAMPLES] = {0};
+byte weightIndex = 0;
+
+// Pill reminder timing
+unsigned long lastCycle = 0;
+const unsigned long cycleDelay = 60000; // 1 min delay before next pill reminder
+
+// -------- Functions --------
+void showSplash() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Pillbox System");
+  lcd.setCursor(0, 1);
+  lcd.print("ESP32 Ready!");
+  delay(1500);
+  lcd.clear();
+}
+
+void readRFID() {
+  if (!rfid.PICC_IsNewCardPresent()) return;
+  if (!rfid.PICC_ReadCardSerial()) return;
+
+  String uid = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  lastUID = uid;
+
+  Serial.print("RFID UID: ");
+  Serial.println(uid);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("RFID UID:");
+  lcd.setCursor(0, 1);
+  lcd.print(uid);
+  delay(1200);
+  lcd.clear();
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+void handleSerial() {
+  if (!Serial.available()) return;
+  String s = Serial.readStringUntil('\n');
+  s.trim();
+
+  if (s.equalsIgnoreCase("t")) {
+    zero_offset = scale.read();
+    Serial.print("Tare done. Zero offset = ");
+    Serial.println(zero_offset);
+  } else if (s.charAt(0) == 'c') {
+    float known_weight = s.substring(1).toFloat();
+    long raw_with_weight = scale.read();
+    calibration_factor = (float)(raw_with_weight - zero_offset) / known_weight;
+    Serial.print("Calibration done. Factor = ");
+    Serial.println(calibration_factor);
+  }
+}
+
+float getSmoothedWeight(float new_weight) {
+  weightBuffer[weightIndex] = new_weight;
+  weightIndex = (weightIndex + 1) % WEIGHT_SAMPLES;
+
+  float sum = 0;
+  for (byte i = 0; i < WEIGHT_SAMPLES; i++) sum += weightBuffer[i];
+  return sum / WEIGHT_SAMPLES;
+}
+
+// -------- Buzzer Functions --------
+void buzzShort() {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(200);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// -------- Setup --------
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  lcd.begin(16, 2);
+  showSplash();
+
+  pinMode(IR_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  scale.begin(HX_DOUT, HX_SCK);
+  scale.set_scale();
+  scale.tare();
+  zero_offset = scale.read();
+  Serial.print("Zero offset: ");
+  Serial.println(zero_offset);
+
+  SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID_SS);
+  rfid.PCD_Init();
+  Serial.println("RFID Ready");
+
+  lcd.setCursor(0, 0);
+  lcd.print("Scan RFID Tag");
+  delay(900);
+  lcd.clear();
+}
+
+// -------- Main Loop --------
+void loop() {
+  readRFID();
+  bool pillTaken = (digitalRead(IR_PIN) == LOW); // LOW = pill taken
+  handleSerial();
+
+  // -------- Display weight, IR, RFID on LCD --------
+  if (scale.is_ready()) {
+    long raw = scale.read_average(5);
+    float weight = (raw - zero_offset) / calibration_factor;
+    float smoothWeight = getSmoothedWeight(weight);
+
+    if (millis() - pageTimer > 2000) {
+      pageTimer = millis();
+      page = (page + 1) % 3;
+      lcd.clear();
+    }
+
+    switch (page) {
+      case 0:
+        lcd.setCursor(0, 0);
+        lcd.print("Weight:");
+        lcd.setCursor(0, 1);
+        lcd.print(smoothWeight, 1);
+        lcd.print(" g");
+        break;
+
+      case 1:
+        lcd.setCursor(0, 0);
+        lcd.print("IR Sensor:");
+        lcd.setCursor(0, 1);
+        lcd.print(pillTaken ? "Pill Taken!" : "Waiting...");
+        break;
+
+      case 2:
+        lcd.setCursor(0, 0);
+        lcd.print("Last RFID:");
+        lcd.setCursor(0, 1);
+        lcd.print(lastUID);
+        break;
+    }
+
+    Serial.print("Raw=");
+    Serial.print(raw);
+    Serial.print(" | Weight=");
+    Serial.println(smoothWeight, 1);
+    Serial.print(" | IR=");
+    Serial.println(pillTaken ? "LOW" : "HIGH");
+  }
+
+  // -------- Continuous buzzer until pill taken --------
+  unsigned long now = millis();
+  if (!pillTaken && !pillAlerted) {
+    static unsigned long lastBuzzTime = 0;
+    if (now - lastBuzzTime >= 500) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(300);
+      digitalWrite(BUZZER_PIN, LOW);
+      lastBuzzTime = now;
+    }
+  } else if (pillTaken && !pillAlerted) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzShort();
+    pillAlerted = true;
+    lastCycle = now;
+  }
+
+  // -------- Reset pillAlerted after delay for next cycle --------
+  if (pillAlerted && (now - lastCycle >= cycleDelay)) {
+    pillAlerted = false;
+  }
+
+  delay(100);
+}
